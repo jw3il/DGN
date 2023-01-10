@@ -70,6 +70,8 @@ for i in range(n_router):
 for e in edges:
 	plt.plot([router[e.start].x,router[e.end].x],[router[e.start].y,router[e.end].y],color='black')
 
+# plt.show()
+
 data = []
 n_data = 20
 for i in range(n_data):
@@ -193,8 +195,17 @@ def MLP():
 	model = Model(input=In_0,output=h)
 	return model
 
-def MultiHeadsAttModel(l=2, d=128, dv=16, dout=128, nv = 8 ):
+def MultiHeadsAttModel(l=2, d=128, dv=16, dout=128, nv = 8):
+	"""
+	Custom multi-head attention module
 
+	:param l: number of neighbors (including self), defaults to 2
+	:param d: output dimension of state encoder, defaults to 128
+	:param dv: dimension of value, key and query, defaults to 16
+	:param dout: output dimension, defaults to 128
+	:param nv: number of attention heads, defaults to 8
+	:return: multi-head attention module
+	"""
 	v1 = Input(shape = (l, d))
 	q1 = Input(shape = (l, d))
 	k1 = Input(shape = (l, d))
@@ -224,8 +235,7 @@ def MultiHeadsAttModel(l=2, d=128, dv=16, dout=128, nv = 8 ):
 	model = Model(inputs=[q1,k1,v1,ve], outputs=out)
 	return model
 
-def Q_Net(action_dim):
-
+def Q_Net(action_dim, use_communication):
 	I1 = Input(shape = (1, 128))
 	I2 = Input(shape = (1, 128))
 	I3 = Input(shape = (1, 128))
@@ -234,17 +244,25 @@ def Q_Net(action_dim):
 	h2 = Flatten()(I2)
 	h3 = Flatten()(I3)
 
-	h = Concatenate()([h1,h2,h3])
+	if use_communication:
+		h = Concatenate()([h1,h2,h3])
+	else:
+		h = h1
+	
 	V = Dense(action_dim,kernel_initializer='random_normal')(h)
-
-	model = Model(input=[I1,I2,I3],output=V)
-	return model
+	
+	if use_communication:
+		return Model(input=[I1,I2,I3],output=V)
+	else:
+		return Model(input=[I1],output=V)
 
 ######build the model#########
+use_communication = False
+
 encoder = MLP()
 m1 = MultiHeadsAttModel(l=neighbors)
 m2 = MultiHeadsAttModel(l=neighbors)
-q_net = Q_Net(action_dim = action_space)
+q_net = Q_Net(action_dim = action_space, use_communication=use_communication)
 vec = np.zeros((1,neighbors))
 vec[0][0] = 1
 
@@ -273,7 +291,10 @@ for j in range(n_data):
 
 V = []
 for j in range(n_data):
-	V.append(q_net([feature[j],relation1[j],relation2[j]]))
+	if use_communication:
+		V.append(q_net([feature[j],relation1[j],relation2[j]]))
+	else:
+		V.append(q_net([feature[j]]))
 
 model = Model(input=In,output=V)
 model.compile(optimizer=Adam(lr = 0.001), loss='mse')
@@ -282,7 +303,7 @@ model.compile(optimizer=Adam(lr = 0.001), loss='mse')
 encoder_t = MLP()
 m1_t = MultiHeadsAttModel(l=neighbors)
 m2_t = MultiHeadsAttModel(l=neighbors)
-q_net_t = Q_Net(action_dim = action_space)
+q_net_t = Q_Net(action_dim = action_space, use_communication=use_communication)
 In_t= []
 for j in range(n_data):
 	In_t.append(Input(shape=[len_feature]))
@@ -309,7 +330,10 @@ for j in range(n_data):
 
 V_t = []
 for j in range(n_data):
-	V_t.append(q_net_t([feature_t[j],relation1_t[j],relation2_t[j]]))
+	if use_communication:
+		V_t.append(q_net_t([feature_t[j],relation1_t[j],relation2_t[j]]))
+	else:
+		V_t.append(q_net_t([feature_t[j]]))
 
 model_t = Model(input=In_t,output=V_t)
 
@@ -326,7 +350,7 @@ num = 0
 times = [0]*n_data
 total_time = 0
 buff=ReplayBuffer(capacity)
-f = open('log_router_gqn.txt','w')
+f = open(f"log_router_gqn{'' if use_communication else '_no_comm'}.txt",'w')
 
 #########playing#########
 while(1):
@@ -368,23 +392,43 @@ while(1):
 
 	score += sum(reward)
 	if i_episode %100 ==0:
-		print(int(i_episode/100))
+		print(int(i_episode/100),end='\t')
 		print(score/100,end='\t')
 		f.write(str(score/100)+'\t')
+		print(score/(100 * n_data),end='\t')
+		f.write(str(score/(100 * n_data))+'\t')
 		if num !=0:
 			print(total_time/num,end='\t')
 			f.write(str(total_time/num)+'\t')
 		else :
 			print(0,end='\t')
 			f.write(str(0)+'\t')
+		print(alpha,end='\t')
 		print(num,end='\t')
 		print(loss/100)
-		f.write(str(num)+'\t'+str(loss/100)+'\n')
+		f.write(str(alpha)+'\t'+str(num)+'\t'+str(loss/100)+'\n')
+		f.flush()
 		loss = 0
 		score = 0
 		num = 0
 		total_time = 0
 		
+		alpha*=0.996
+		if alpha<0.01:
+			alpha=0.01
+
+
+	if i_episode % 300 == 0:
+		# reset packets
+		data.clear()
+		for i in range(n_data):
+			data.append(Data(np.random.randint(n_router),np.random.randint(n_router),np.random.random(),i))
+			times[i] = 0
+		
+		total_time = 0
+
+		for edge in edges:
+			edge.load = 0
 
 	if i_episode < episode_before_train:
 		continue
@@ -456,7 +500,8 @@ while(1):
 		target_weights[w] = TAU * weights[w] + (1 - TAU)* target_weights[w]
 	m2_t.set_weights(target_weights)
 	
-	model.save('dgn.h5')
+	if i_episode % 1000 == 0:
+		model.save(f"dgn{'' if use_communication else '_no_comm'}.h5")
 
 	'''
 	####show####
